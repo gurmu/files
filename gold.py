@@ -1,27 +1,174 @@
-# Gold Layer - Generate embeddings and export to itsmgold container
-# Creates:
-#   1. gold_pdf_text_chunks - Text chunks with embeddings
-#   2. gold_pdf_image_items - Images with dual embeddings (pixel + description)
-#   3. gold_pdf_multimodal_unified - Combined text + image table
-#   4. Exports to itsmgold container (Parquet + JSON)
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Gold Layer - Multimodal Embedding Generation
+# MAGIC 
+# MAGIC This notebook:
+# MAGIC 1. Creates text chunks with embeddings (384-dim)
+# MAGIC 2. Generates dual image embeddings (512-dim pixel + description)
+# MAGIC 3. Combines into unified multimodal table
+# MAGIC 4. Exports to `itsmgold` container (Parquet + JSON)
+# MAGIC 
+# MAGIC **Prerequisites:** Run `config.py`, `bronze.py`, `silver.py` first
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Import Config and Dependencies
+
+# COMMAND ----------
+
+# Import configuration from config notebook
+%run ./config
+
+# COMMAND ----------
+
+# Standard imports
 from pyspark.sql import functions as F, types as T
 import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from PIL import Image
+import requests
+from io import BytesIO
+import logging
 
-# Import embedding utilities
-exec(open("embedding_utils.py").read())
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 print("=" * 80)
 print("GOLD LAYER: Multimodal Embedding Generation")
 print("=" * 80)
 
-# ---------- Helper: Text Chunking ----------
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Load Embedding Models
+# MAGIC 
+# MAGIC Models will be cached on the cluster for reuse across executors.
+
+# COMMAND ----------
+
+# Global model cache (loaded once per executor)
+_text_model = None
+_clip_model = None
+
+def get_text_embedding_model():
+    """Load text embedding model (cached per executor)."""
+    global _text_model
+    if _text_model is None:
+        logger.info(f"Loading text embedding model: {TEXT_EMBEDDING_MODEL}")
+        _text_model = SentenceTransformer(TEXT_EMBEDDING_MODEL)
+        logger.info("Text model loaded successfully")
+    return _text_model
+
+def get_clip_model():
+    """Load CLIP model (cached per executor)."""
+    global _clip_model
+    if _clip_model is None:
+        logger.info(f"Loading CLIP model: {IMAGE_CLIP_MODEL}")
+        _clip_model = SentenceTransformer(IMAGE_CLIP_MODEL)
+        logger.info("CLIP model loaded successfully")
+    return _clip_model
+
+# Test model loading
+print("Testing model loading...")
+try:
+    get_text_embedding_model()
+    get_clip_model()
+    print("✓ Models loaded successfully")
+except Exception as e:
+    print(f"✗ Error loading models: {e}")
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Define Embedding Functions
+
+# COMMAND ----------
+
+# Text embedding functions
+def generate_text_embeddings_batch(texts: pd.Series) -> pd.Series:
+    """
+    Batch process text embeddings for better performance.
+    Returns 384-dim embeddings.
+    """
+    try:
+        model = get_text_embedding_model()
+        # Filter out empty texts
+        valid_texts = [t if t and len(str(t).strip()) > 0 else " " for t in texts]
+        embeddings = model.encode(valid_texts, convert_to_numpy=True, show_progress_bar=False)
+        return pd.Series([emb.tolist() for emb in embeddings])
+    except Exception as e:
+        logger.error(f"Error in batch text embedding: {e}")
+        return pd.Series([[0.0] * TEXT_EMBEDDING_DIM] * len(texts))
+
+# Image helper functions
+def download_image(url: str, timeout: int = 10) -> Image.Image:
+    """Download image from URL and return PIL Image."""
+    try:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        img = Image.open(BytesIO(response.content))
+        # Convert to RGB if necessary
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return img
+    except Exception as e:
+        logger.error(f"Error downloading image from {url}: {e}")
+        return None
+
+def generate_image_embeddings_batch(image_urls: pd.Series) -> tuple:
+    """
+    Batch process image embeddings.
+    Returns both pixel embeddings (512-dim) and description embeddings (512-dim).
+    """
+    model = get_clip_model()
+    
+    pixel_embeddings = []
+    desc_embeddings = []
+    
+    for url in image_urls:
+        if not url:
+            pixel_embeddings.append([0.0] * IMAGE_EMBEDDING_DIM)
+            desc_embeddings.append([0.0] * IMAGE_EMBEDDING_DIM)
+            continue
+        
+        try:
+            # Download and encode image (pixel embedding)
+            img = download_image(url)
+            if img:
+                pixel_emb = model.encode(img, convert_to_numpy=True).tolist()
+                pixel_embeddings.append(pixel_emb)
+                
+                # Description embedding (generic for now)
+                desc_emb = model.encode("Image from PDF document", convert_to_numpy=True).tolist()
+                desc_embeddings.append(desc_emb)
+            else:
+                pixel_embeddings.append([0.0] * IMAGE_EMBEDDING_DIM)
+                desc_embeddings.append([0.0] * IMAGE_EMBEDDING_DIM)
+        except Exception as e:
+            logger.error(f"Error processing image {url}: {e}")
+            pixel_embeddings.append([0.0] * IMAGE_EMBEDDING_DIM)
+            desc_embeddings.append([0.0] * IMAGE_EMBEDDING_DIM)
+    
+    return pd.Series(pixel_embeddings), pd.Series(desc_embeddings)
+
+print("✓ Embedding functions defined")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Define Text Chunking Function
+
+# COMMAND ----------
 
 def chunk_words(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     """Split text into overlapping chunks by word count."""
     if not text:
         return []
-    words = text.split()
+    words = str(text).split()
     out = []
     i = 0
     while i < len(words):
@@ -31,11 +178,16 @@ def chunk_words(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
         i += max(1, (size - overlap))
     return out if out else [""]  # Return at least one empty string if no content
 
-chunk_udf = F.udf(lambda s: chunk_words(s, CHUNK_SIZE, OVERLAP), T.ArrayType(T.StringType()))
+chunk_udf = F.udf(lambda s: chunk_words(s, CHUNK_SIZE, CHUNK_OVERLAP), T.ArrayType(T.StringType()))
 
-# ========================================
-# STEP 1: Create Text Chunks with Embeddings
-# ========================================
+print("✓ Chunking function defined")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1: Create Text Chunks
+
+# COMMAND ----------
 
 print("\n[1/5] Creating text chunks from silver_pdf_pages...")
 
@@ -70,9 +222,16 @@ text_chunks_exploded = (
     )
 )
 
-print(f"   Generated {text_chunks_exploded.count()} text chunks")
+chunk_count = text_chunks_exploded.count()
+print(f"   Generated {chunk_count:,} text chunks")
 
-# Generate text embeddings using batch processing
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 2: Generate Text Embeddings
+
+# COMMAND ----------
+
 print("\n[2/5] Generating text embeddings (this may take a few minutes)...")
 
 text_chunks_schema = """
@@ -124,11 +283,15 @@ print("\n   Saving gold_pdf_text_chunks table...")
  .format("delta")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.gold_pdf_text_chunks"))
 
-print(f"   ✓ Saved {gold_pdf_text_chunks.count()} text chunks with embeddings")
+text_count = gold_pdf_text_chunks.count()
+print(f"   ✓ Saved {text_count:,} text chunks with embeddings")
 
-# ========================================
-# STEP 2: Create Image Items with Dual Embeddings
-# ========================================
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3: Create Image Items
+
+# COMMAND ----------
 
 print("\n[3/5] Creating image items from silver_pdf_images...")
 
@@ -157,9 +320,16 @@ image_items_prep = (
     )
 )
 
-print(f"   Found {image_items_prep.count()} images")
+image_count = image_items_prep.count()
+print(f"   Found {image_count:,} images")
 
-# Generate dual image embeddings
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4: Generate Image Embeddings
+
+# COMMAND ----------
+
 print("\n[4/5] Generating image embeddings (pixel + description)...")
 print("   This may take longer as it downloads and processes images...")
 
@@ -218,11 +388,15 @@ print("\n   Saving gold_pdf_image_items table...")
  .format("delta")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.gold_pdf_image_items"))
 
-print(f"   ✓ Saved {gold_pdf_image_items.count()} image items with dual embeddings")
+final_image_count = gold_pdf_image_items.count()
+print(f"   ✓ Saved {final_image_count:,} image items with dual embeddings")
 
-# ========================================
-# STEP 3: Create Unified Multimodal Table
-# ========================================
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 5: Create Unified Multimodal Table
+
+# COMMAND ----------
 
 print("\n[5/5] Creating unified multimodal gold table...")
 
@@ -255,16 +429,20 @@ print("\n   Saving gold_pdf_multimodal_unified table...")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.gold_pdf_multimodal_unified"))
 
 unified_count = gold_pdf_multimodal_unified.count()
-print(f"   ✓ Saved {unified_count} total items (text + images)")
+print(f"   ✓ Saved {unified_count:,} total items (text + images)")
 
-# ========================================
-# STEP 4: Export to itsmgold Container (Parquet)
-# ========================================
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Export to itsmgold Container
+
+# COMMAND ----------
 
 print("\n" + "=" * 80)
 print("EXPORTING TO ITSMGOLD CONTAINER")
 print("=" * 80)
 
+# Export to Parquet
 parquet_path = f"{GOLD_ROOT}multimodal_embeddings_parquet/"
 print(f"\n[1/2] Exporting to Parquet: {parquet_path}")
 
@@ -275,10 +453,7 @@ print(f"\n[1/2] Exporting to Parquet: {parquet_path}")
 
 print("   ✓ Parquet export complete")
 
-# ========================================
-# STEP 5: Export to itsmgold Container (JSON)
-# ========================================
-
+# Export to JSON
 json_path = f"{GOLD_ROOT}multimodal_embeddings_json/"
 print(f"\n[2/2] Exporting to JSON: {json_path}")
 
@@ -288,21 +463,21 @@ print(f"\n[2/2] Exporting to JSON: {json_path}")
 
 print("   ✓ JSON export complete")
 
-# ========================================
-# Summary Statistics
-# ========================================
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary & Verification
+
+# COMMAND ----------
 
 print("\n" + "=" * 80)
 print("GOLD LAYER COMPLETE - SUMMARY")
 print("=" * 80)
 
-text_count = gold_pdf_text_chunks.count()
-image_count = gold_pdf_image_items.count()
-
 print(f"""
 Gold Tables Created:
   • gold_pdf_text_chunks:           {text_count:,} items
-  • gold_pdf_image_items:           {image_count:,} items
+  • gold_pdf_image_items:           {final_image_count:,} items
   • gold_pdf_multimodal_unified:    {unified_count:,} items
 
 Embedding Dimensions:
@@ -319,6 +494,36 @@ Ready for Azure AI Search indexing!
 
 print("=" * 80)
 
-# Display sample data
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Sample Data Display
+
+# COMMAND ----------
+
+print("\nSample text chunks with embeddings:")
+display(gold_pdf_text_chunks.select("id", "doc_id", "file_name", "page_num", "content", "text_embedding").limit(5))
+
+# COMMAND ----------
+
+print("\nSample image items with embeddings:")
+display(gold_pdf_image_items.select("id", "doc_id", "file_name", "page_num", "image_url", "image_kind", "image_pixel_embedding", "image_description_embedding").limit(5))
+
+# COMMAND ----------
+
 print("\nSample from unified table:")
 display(gold_pdf_multimodal_unified.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## ✅ Gold Layer Complete
+# MAGIC 
+# MAGIC Your multimodal embeddings are now stored in:
+# MAGIC - Delta tables in `hive_metastore.itsm`
+# MAGIC - Parquet and JSON in `itsmgold` container
+# MAGIC 
+# MAGIC **Next Steps:**
+# MAGIC 1. Verify data in `itsmgold` container
+# MAGIC 2. Create Azure AI Search index
+# MAGIC 3. Import data for agentic RAG

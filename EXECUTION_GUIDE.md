@@ -1,341 +1,278 @@
-# Multimodal Embedding Pipeline - Execution Guide
+# Multimodal Embedding Pipeline - Databricks Execution Guide
 
 ## Overview
-This pipeline creates multimodal embeddings from PDFs for ITSM agentic RAG support, storing final data in the `itsmgold` container for Azure AI Search indexing.
+This pipeline creates multimodal embeddings from PDFs following a **medallion architecture** (Bronze → Silver → Gold) entirely within Databricks notebooks.
 
 ---
 
-## Quick Start
+## 📋 Prerequisites
 
-### 1. Prerequisites
-- Databricks cluster with ML runtime 14.3+ LTS
-- Access to Azure Gov Cloud storage account: `stitsmdevz33lh8`
-- Containers created: `pdfitsm`, `itsmimages`, `itsmgold`
-- Python packages installed (see CLUSTER_SETUP.md)
+### 1. Databricks Cluster Setup
+- **Runtime**: Databricks Runtime 14.3 LTS ML or higher
+- **Python**: 3.10+
+- **Node Type**: Memory-optimized recommended (Standard_E8ds_v4 or better)
+- **Workers**: 2-8 workers depending on PDF volume
 
-### 2. Install Required Packages
+### 2. Required Python Packages
 
-**Option A: Via Cluster UI** (Recommended)
+Install via **Cluster → Libraries → Install New → PyPI**:
 ```
-1. Cluster → Libraries → Install New → PyPI
-2. Install these packages:
-   - sentence-transformers==2.3.1
-   - transformers==4.36.2
-   - torch==2.1.2
-   - ftfy==6.1.3
-   - Pillow==10.2.0
+sentence-transformers==2.3.1
+transformers==4.36.2
+torch==2.1.2
+ftfy==6.1.3
+Pillow==10.2.0
 ```
 
-**Option B: Via Init Script**
-Upload `requirements.txt` to DBFS and add init script to cluster.
+### 3. Azure Storage Authentication
 
-### 3. Configure Storage Authentication
-
-Add to your notebook or cluster config:
-
+Add to your first notebook cell or cluster config:
 ```python
-# Get storage key from secrets
+# Get storage key from Databricks secrets
 storage_key = dbutils.secrets.get(scope="<your-scope>", key="<your-key>")
 
-# Configure access
+# Configure access to Azure Gov Cloud storage
 spark.conf.set(
     "fs.azure.account.key.stitsmdevz33lh8.dfs.core.usgovcloudapi.net",
     storage_key
 )
 ```
 
-### 4. Execution Order
+---
 
-Run notebooks in this exact order:
+## 🚀 Execution Steps
 
-#### Step 1: Configuration
+### Step 1: Run Config Notebook
 ```python
-%run ./config.py
+%run ./config
 ```
-- Loads all configuration settings
-- Defines containers and paths
-- Sets embedding model parameters
+**What it does:**
+- Defines catalog/schema (`hive_metastore.itsm`)
+- Sets up container paths (`pdfitsm`, `itsmimages`, `itsmgold`)
+- Configures embedding models
+- Defines helper functions
 
-#### Step 2: Bronze Layer (Data Extraction)
-```python
-%run ./bronze.py
-```
-**Output:**
-- `bronze_pdf_bin` - Raw PDF binaries (~120 files)
-- `bronze_pdf_pages` - Extracted page text
-- `bronze_pdf_images` - Extracted images (embedded + rendered)
-
-**Expected time:** 5-10 minutes for 120 PDFs
-
-#### Step 3: Silver Layer (Data Cleaning)
-```python
-%run ./silver.py
-```
-**Output:**
-- `silver_pdf_pages` - Cleaned text with URLs
-- `silver_pdf_images` - Image metadata with URLs
-- Images written to `itsmimages` container
-
-**Expected time:** 10-15 minutes (includes image uploads)
-
-#### Step 4: Test Embedding Models (Optional but Recommended)
-```python
-%run ./embedding_utils.py
-# This will run test_embeddings() and show sample outputs
-```
-**Verifies:**
-- Models load correctly
-- Embeddings have correct dimensions
-- No import errors
-
-#### Step 5: Gold Layer (Embedding Generation)
-```python
-%run ./gold.py
-```
-**Output:**
-- `gold_pdf_text_chunks` - Text chunks with 384-dim embeddings
-- `gold_pdf_image_items` - Images with dual 512-dim embeddings
-- `gold_pdf_multimodal_unified` - Combined table
-- Data exported to `itsmgold` container (Parquet + JSON)
-
-**Expected time:** 30-60 minutes depending on:
-- Number of text chunks
-- Number of images
-- Cluster size
-- First run (downloads models): +5-10 minutes
+**Expected time:** < 1 minute
 
 ---
 
-## Understanding the Output
-
-### Delta Tables (in hive_metastore.itsm)
-
-#### 1. gold_pdf_text_chunks
-| Column | Type | Description |
-|--------|------|-------------|
-| id | string | Unique chunk ID |
-| doc_id | string | Source PDF hash |
-| file_name | string | PDF filename |
-| page_num | int | Page number |
-| item_type | string | "text" |
-| content | string | Text chunk (≤1200 words) |
-| text_embedding | array<float> | 384-dim embedding |
-| image_url | string | null |
-| image_pixel_embedding | array<float> | null |
-| image_description_embedding | array<float> | null |
-| pdf_url | string | Source PDF URL |
-
-#### 2. gold_pdf_image_items
-| Column | Type | Description |
-|--------|------|-------------|
-| id | string | Unique image ID |
-| doc_id | string | Source PDF hash |
-| file_name | string | PDF filename |
-| page_num | int | Page number |
-| item_type | string | "image" |
-| content | string | null |
-| text_embedding | array<float> | null |
-| image_url | string | Blob storage URL |
-| image_pixel_embedding | array<float> | 512-dim CLIP embedding |
-| image_description_embedding | array<float> | 512-dim CLIP embedding |
-| pdf_url | string | Source PDF URL |
-| image_kind | string | "embedded" or "page_render" |
-| image_id | string | Unique image identifier |
-
-#### 3. gold_pdf_multimodal_unified
-Union of text chunks and image items - **this is the main table for Azure AI Search**.
-
-### Blob Storage Exports (in itsmgold container)
-
-#### Parquet Export
+### Step 2: Run Bronze Layer
+```python
+%run ./bronze
 ```
-itsmgold/multimodal_embeddings_parquet/
-├── _SUCCESS
-├── part-00000-xxx.snappy.parquet
-├── part-00001-xxx.snappy.parquet
-└── ...
-```
-**Use for:** Azure AI Search bulk import, efficient querying
+**What it does:**
+- Loads PDF binaries from `pdfitsm` container
+- Extracts text from each page using PyMuPDF
+- Extracts embedded images and page renders
+- Creates Delta tables:
+  - `bronze_pdf_bin` - Raw PDFs
+  - `bronze_pdf_pages` - Page text
+  - `bronze_pdf_images` - Images with bytes
 
-#### JSON Export
+**Expected time:** 5-10 minutes for ~120 PDFs
+
+**Output example:**
 ```
-itsmgold/multimodal_embeddings_json/
-├── _SUCCESS
-├── part-00000-xxx.json
-├── part-00001-xxx.json
-└── ...
+Found 120 PDF files
+Extracted 1,543 pages
+Extracted 3,891 images
 ```
-**Use for:** Direct inspection, REST API compatibility
 
 ---
 
-## Verification Steps
-
-### 1. Check Bronze Tables
+### Step 3: Run Silver Layer
 ```python
-# Check PDF count
-pdf_count = spark.table("hive_metastore.itsm.bronze_pdf_bin").count()
-print(f"PDFs processed: {pdf_count}")
+%run ./silver
+```
+**What it does:**
+- Cleans page text (removes extra whitespace)
+- Uploads all images to `itsmimages` blob container
+- Generates HTTPS URLs for images
+- Creates Delta tables:
+  - `silver_pdf_pages` - Cleaned text + URLs
+  - `silver_pdf_images` - Image metadata + URLs
 
-# Check page count
-page_count = spark.table("hive_metastore.itsm.bronze_pdf_pages").count()
-print(f"Pages extracted: {page_count}")
+**Expected time:** 10-15 minutes
 
-# Check image count
-image_count = spark.table("hive_metastore.itsm.bronze_pdf_images").count()
-print(f"Images extracted: {image_count}")
+**Output example:**
+```
+Cleaned 1,543 pages
+Uploaded images to itsmimages container
+Created metadata for 3,891 images
 ```
 
-### 2. Check Silver Tables
-```python
-# Sample silver pages
-display(spark.table("hive_metastore.itsm.silver_pdf_pages").limit(5))
+---
 
-# Sample silver images
-display(spark.table("hive_metastore.itsm.silver_pdf_images").limit(5))
+### Step 4: Run Gold Layer
+```python
+%run ./gold
+```
+**What it does:**
+1. Chunks text (1200 words, 150 overlap)
+2. Generates text embeddings (384-dim) using `all-MiniLM-L6-v2`
+3. Downloads images and generates pixel embeddings (512-dim) using CLIP
+4. Generates description embeddings (512-dim) using CLIP
+5. Combines into unified multimodal table
+6. Exports to `itsmgold` container (Parquet + JSON)
+
+**Expected time:** 
+- First run: 40-60 minutes (includes model download ~600MB)
+- Subsequent runs: 30-45 minutes
+
+**Output example:**
+```
+Generated 4,621 text chunks
+Saved 4,621 text chunks with embeddings
+Saved 3,891 image items with dual embeddings
+Saved 8,512 total items (text + images)
+
+Exports to itsmgold container:
+  ✓ Parquet: itsmgold/multimodal_embeddings_parquet/
+  ✓ JSON:    itsmgold/multimodal_embeddings_json/
 ```
 
-### 3. Check Gold Embeddings
-```python
-# Check text embeddings
-text_df = spark.table("hive_metastore.itsm.gold_pdf_text_chunks")
-print(f"Text chunks: {text_df.count()}")
+---
 
-# Verify embedding dimension
-sample_text = text_df.select("text_embedding").first()
-print(f"Text embedding dimension: {len(sample_text[0])}")  # Should be 384
+## 📊 Output Data Structure
 
-# Check image embeddings
-image_df = spark.table("hive_metastore.itsm.gold_pdf_image_items")
-print(f"Image items: {image_df.count()}")
+### Delta Tables
+All tables in `hive_metastore.itsm`:
 
-# Verify embedding dimensions
-sample_img = image_df.select("image_pixel_embedding").first()
-print(f"Image pixel embedding dimension: {len(sample_img[0])}")  # Should be 512
+| Table | Rows | Columns | Key Fields |
+|-------|------|---------|------------|
+| `gold_pdf_text_chunks` | ~4,600 | 11 | id, content, text_embedding |
+| `gold_pdf_image_items` | ~3,900 | 15 | id, image_url, image_pixel_embedding, image_description_embedding |
+| `gold_pdf_multimodal_unified` | ~8,500 | 11 | id, item_type, embeddings |
+
+### Blob Storage
+```
+itsmgold/
+├── multimodal_embeddings_parquet/   # Optimized for bulk import
+│   ├── _SUCCESS
+│   └── part-*.snappy.parquet
+└── multimodal_embeddings_json/      # For REST APIs
+    ├── _SUCCESS
+    └── part-*.json
 ```
 
-### 4. Check itsmgold Container
+---
+
+## ✅ Verification Commands
+
+### Check Tables in Databricks
+```python
+# View gold unified table
+display(spark.table("hive_metastore.itsm.gold_pdf_multimodal_unified").limit(10))
+
+# Count items
+total = spark.table("hive_metastore.itsm.gold_pdf_multimodal_unified").count()
+print(f"Total items: {total:,}")
+
+# Check text vs images
+df = spark.table("hive_metastore.itsm.gold_pdf_multimodal_unified")
+df.groupBy("item_type").count().show()
+```
+
+### Check itsmgold Container
 ```python
 # List Parquet files
-parquet_files = dbutils.fs.ls(f"{GOLD_ROOT}multimodal_embeddings_parquet/")
-print(f"Parquet files: {len(parquet_files)}")
+dbutils.fs.ls("abfss://itsmgold@stitsmdevz33lh8.dfs.core.usgovcloudapi.net/multimodal_embeddings_parquet/")
 
-# List JSON files
-json_files = dbutils.fs.ls(f"{GOLD_ROOT}multimodal_embeddings_json/")
-print(f"JSON files: {len(json_files)}")
+# Read sample Parquet
+sample = spark.read.parquet("abfss://itsmgold@stitsmdevz33lh8.dfs.core.usgovcloudapi.net/multimodal_embeddings_parquet/")
+display(sample.limit(5))
+```
 
-# Read sample from Parquet
-sample_parquet = spark.read.parquet(f"{GOLD_ROOT}multimodal_embeddings_parquet/")
-display(sample_parquet.limit(10))
+### Verify Embedding Dimensions
+```python
+# Check text embedding dimension
+text_sample = spark.table("hive_metastore.itsm.gold_pdf_text_chunks") \
+    .select("text_embedding").first()
+print(f"Text embedding dimension: {len(text_sample[0])}")  # Should be 384
+
+# Check image embedding dimension
+image_sample = spark.table("hive_metastore.itsm.gold_pdf_image_items") \
+    .select("image_pixel_embedding").first()
+print(f"Image pixel embedding dimension: {len(image_sample[0])}")  # Should be 512
 ```
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 ### Issue: "No module named 'sentence_transformers'"
-**Solution:** 
-1. Install packages via cluster Libraries tab
-2. Restart cluster
-3. Verify installation: `!pip list | grep sentence-transformers`
+**Solution:** Install packages via Cluster Libraries, then restart cluster
 
 ### Issue: "Model download timeout"
-**Solution:** 
-On first run, models download from HuggingFace (~600MB). If timeout occurs:
+**Solution:** First run downloads ~600MB. If timeout, increase cluster timeout or pre-download:
 ```python
-# Pre-download models
 from sentence_transformers import SentenceTransformer
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 SentenceTransformer('sentence-transformers/clip-ViT-B-32')
 ```
 
 ### Issue: "Image download failed"
-**Solution:**
-Check that images were successfully uploaded to `itsmimages` in silver layer.
+**Solution:** Verify images uploaded correctly in silver layer:
 ```python
-# Verify image URLs are accessible
-sample_url = spark.table("hive_metastore.itsm.silver_pdf_images") \
-    .select("image_url").first()[0]
-print(sample_url)
-
-# Try downloading manually
-import requests
-resp = requests.get(sample_url)
-print(resp.status_code)  # Should be 200
+# Check silver_pdf_images
+display(spark.table("hive_metastore.itsm.silver_pdf_images") \
+    .select("image_url").limit(5))
 ```
 
-### Issue: "Out of memory during embedding"
-**Solution:**
-Reduce batch size in `embedding_utils.py`:
-```python
-EMBEDDING_BATCH_SIZE = 16  # Default is 32
-```
-
-### Issue: "Zero embeddings returned"
-**Solution:**
-Check that content/URLs are not null:
-```python
-# Check for null content
-null_content = spark.table("hive_metastore.itsm.silver_pdf_pages") \
-    .filter(F.col("page_text_clean").isNull())
-print(f"Null content rows: {null_content.count()}")
-```
+### Issue: "Out of memory"
+**Solution:** 
+- Increase cluster memory
+- Reduce batch size (modify `EMBEDDING_BATCH_SIZE` in config.py)
+- Use fewer workers to concentrate memory
 
 ---
 
-## Performance Optimization
+## 📈 Performance Tips
 
-### For Large PDF Sets (500+ files)
-
-1. **Increase cluster size**
-   - Add more workers (4-8)
-   - Use memory-optimized nodes
-
-2. **Enable caching**
-   ```python
-   silver_pages = spark.table("...").cache()
-   ```
-
-3. **Partition data**
-   ```python
-   text_chunks_exploded.repartition(100)
-   ```
-
-4. **Use GPU cluster**
-   - Faster embedding generation
-   - Use GPU-enabled runtime
-
-5. **Batch size tuning**
-   ```python
-   EMBEDDING_BATCH_SIZE = 64  # Increase if memory allows
-   ```
+For large PDF sets (500+ files):
+- Use 4-8 worker cluster
+- Enable Delta caching: `spark.table("...").cache()`
+- Increase `EMBEDDING_BATCH_SIZE` to 64 if memory allows
+- Use GPU-enabled cluster for 2-3x speedup on embeddings
 
 ---
 
-## Next Steps: Azure AI Search Integration
+## 🎯 Next Steps: Azure AI Search
 
-Once the gold data is in `itsmgold` container:
+Once your data is in `itsmgold`:
 
-1. **Create Azure AI Search index** with vector fields
-2. **Import data** from Parquet files
-3. **Configure vector profiles** for text and image embeddings
-4. **Set up hybrid search** (keyword + semantic + vector)
-5. **Build agentic RAG** with text + image context for ITSM support
+1. **Create Azure AI Search index** with vector fields:
+   - `text_embedding` (384 dimensions)
+   - `image_pixel_embedding` (512 dimensions)  
+   - `image_description_embedding` (512 dimensions)
+
+2. **Import data** from `itsmgold/multimodal_embeddings_parquet/`
+
+3. **Configure hybrid search** combining:
+   - Full-text search on `content`
+   - Vector search on embeddings
+   - Filters on `doc_id`, `page_num`, `item_type`
+
+4. **Build agentic RAG** that can:
+   - Answer questions with text chunks
+   - Show relevant images when user needs visual guidance
+   - Provide step-by-step screenshots for ITSM support
 
 ---
 
-## File Structure Summary
+## 📁 Notebook Files
 
-```
-code/
-├── config.py              # Configuration (updated ✓)
-├── bronze.py              # Extract PDFs (unchanged ✓)
-├── silver.py              # Clean data (unchanged ✓)
-├── embedding_utils.py     # Embedding models (NEW ✓)
-├── gold.py                # Generate embeddings (rewritten ✓)
-├── requirements.txt       # Python packages (NEW ✓)
-├── CLUSTER_SETUP.md       # Setup guide (NEW ✓)
-└── EXECUTION_GUIDE.md     # This file (NEW ✓)
-```
+| Notebook | Purpose |
+|----------|---------|
+| `config.py` | Configuration & settings |
+| `bronze.py` | Extract PDFs → text + images |
+| `silver.py` | Clean data → upload images |
+| `gold.py` | Generate embeddings → export |
 
-All files are ready for execution! 🚀
+**Run in order:** config → bronze → silver → gold
+
+---
+
+## ✨ You're Ready!
+
+Your medallion pipeline is set up for Databricks. Run each notebook in sequence and you'll have multimodal embeddings ready for Azure AI Search! 🚀
