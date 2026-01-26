@@ -1,131 +1,213 @@
-# Multimodal Embedding Pipeline for Databricks
+# Multimodal Embedding Pipeline - Databricks Standalone Notebooks
 
-## ✅ Ready to Run on Databricks
+## ✅ Ready for Databricks Copy/Paste
 
-This project creates multimodal embeddings from PDFs using a clean **medallion architecture** (Bronze → Silver → Gold) in Databricks notebooks.
-
----
-
-## 🎯 What It Does
-
-Creates an agentic RAG system for ITSM support by:
-1. Extracting text and images from PDFs
-2. Generating text embeddings (384-dim)
-3. Generating dual image embeddings (pixel + description, 512-dim each)
-4. Storing unified data in `itsmgold` container
-5. Ready for Azure AI Search indexing
+All notebooks are **completely standalone** - just copy/paste each file into a Databricks notebook and run in sequence.
 
 ---
 
-## 📁 Databricks Notebooks
+## 📁 Notebook Files (Medallion Architecture)
 
 | Notebook | Run Time | Purpose |
 |----------|----------|---------|
-| **config.py** | < 1 min | Configuration & settings |
+| **config.py** | < 1 min | Configuration & storage authentication |
 | **bronze.py** | 5-10 min | Extract PDFs → text + images |
-| **silver.py** | 10-15 min | Clean data → upload images |
-| **gold.py** | 30-60 min | Generate embeddings → export |
+| **silver.py** | 10-15 min | Clean data → upload images to blob |
+| **gold.py** | 30-60 min | Generate embeddings → export to itsmgold |
 
 **Total Pipeline:** ~50-90 minutes (first run includes model download)
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start Guide
 
-### 1. Install Packages on Databricks Cluster
-```
-Cluster → Libraries → Install New → PyPI
-Add:
-  - sentence-transformers==2.3.1
-  - transformers==4.36.2
-  - torch==2.1.2
-  - ftfy==6.1.3
-  - Pillow==10.2.0
-```
+### Step 1: Install Packages on Databricks Cluster
 
-### 2. Configure Storage Authentication
-Add to first cell of config.py:
-```python
-storage_key = dbutils.secrets.get(scope="<scope>", key="<key>")
-spark.conf.set(
-    "fs.azure.account.key.stitsmdevz33lh8.dfs.core.usgovcloudapi.net",
-    storage_key
-)
+Go to **Cluster → Libraries → Install New → PyPI** and add:
+```
+sentence-transformers==2.3.1
+transformers==4.36.2
+torch==2.1.2
+ftfy==6.1.3
+Pillow==10.2.0
 ```
 
-### 3. Run Notebooks in Order
-```python
-%run ./config   # Load configuration
-%run ./bronze   # Extract PDFs
-%run ./silver   # Clean & upload images
-%run ./gold     # Generate embeddings
-```
-
-That's it! Your embeddings will be in the `itsmgold` container.
+**Then restart your cluster!**
 
 ---
 
-## 📊 Output
+### Step 2: Create Databricks Notebooks
 
-### Delta Tables (hive_metastore.itsm)
-- `gold_pdf_text_chunks` - Text with 384-dim embeddings
+1. In your Databricks workspace, create 4 new notebooks:
+   - `config`
+   - `bronze`
+   - `silver`
+   - `gold`
+
+2. Copy/paste the content of each `.py` file into its corresponding notebook
+
+---
+
+### Step 3: Update Storage Key in config.py
+
+**IMPORTANT:** In the `config` notebook, replace this line:
+```python
+STORAGE_KEY = "<PASTE_KEY1_HERE>".strip()
+```
+
+With your actual storage account key (Key1 from Azure portal):
+```python
+STORAGE_KEY = "your_actual_storage_key_here".strip()
+```
+
+---
+
+### Step 4: Run Notebooks in Sequence
+
+1. **config** notebook - Sets up authentication and configuration
+2. **bronze** notebook - Extracts PDFs from `pdfitsm` container
+3. **silver** notebook - Cleans data and uploads images to `itsmimages`
+4. **gold** notebook - Generates embeddings and exports to `itsmgold`
+
+**That's it!** Your embeddings will be in the `itsmgold` container.
+
+---
+
+## 📊 What You'll Get
+
+### Delta Tables (in hive_metastore.itsm)
+
+- `gold_pdf_text_chunks` - Text chunks with 384-dim embeddings
 - `gold_pdf_image_items` - Images with dual 512-dim embeddings
-- `gold_pdf_multimodal_unified` - Combined table
+- `gold_pdf_multimodal_unified` - **Main table** combining text + images
 
 ### Blob Storage (itsmgold container)
-- `multimodal_embeddings_parquet/` - Parquet format
-- `multimodal_embeddings_json/` - JSON format
+
+- `multimodal_embeddings_parquet/` - Optimized Parquet format
+- `multimodal_embeddings_json/` - JSON format for REST APIs
 
 ---
 
 ## 🔍 Key Features
 
-✅ **Self-contained notebooks** - No external imports, uses `%run` for config  
+✅ **Completely standalone notebooks** - No %run imports, each file is self-contained  
 ✅ **Open-source models** - sentence-transformers + CLIP (no API costs)  
-✅ **Dual image embeddings** - Pixel + description for flexibility  
-✅ **All image types** - Embedded + page renders (for ITSM step-by-step guides)  
-✅ **Dual formats** - Parquet + JSON exports  
-✅ **Production ready** - Error handling, batch processing, logging
+✅ **Dual image embeddings** - Pixel + description for maximum flexibility  
+✅ **All image types** - Embedded images + full page renders  
+✅ **Dual export formats** - Parquet + JSON  
+✅ **Ready for copy/paste** - No configuration files needed
 
 ---
 
-## 📖 Documentation
+## 📖 Notebook Details
 
-- **EXECUTION_GUIDE.md** - Detailed step-by-step instructions
-- **CLUSTER_SETUP.md** - Cluster configuration
-- **requirements.txt** - Python packages list
+### config.py
+- Sets up Azure Gov Cloud storage authentication
+- Defines catalog/schema (`hive_metastore.itsm`)
+- Configures embedding models
+- **⚠️ UPDATE YOUR STORAGE KEY HERE**
 
----
+### bronze.py
+- Loads PDFs from `pdfitsm` container
+- Extracts text using PyMuPDF
+- Extracts embedded images and page renders (150 DPI)
+- Creates 3 Delta tables
 
-## 🎓 For ITSM Agentic RAG
+### silver.py  
+- Cleans page text (removes extra whitespace)
+- Uploads all images to `itsmimages` container
+- Generates HTTPS URLs for each image
+- Creates 2 Delta tables
 
-Perfect for ITSM support where:
-- Users ask questions → Get text answers + relevant screenshots
-- Text confusing? → Show step-by-step visual guides
-- Cross-modal search → Text queries find relevant images
+### gold.py
+- Chunks text (1200 words, 150 overlap)
+- Generates text embeddings (384-dim)
+- Downloads images and generates pixel embeddings (512-dim)
+- Generates  description embeddings (512-dim)
+- Creates unified table and exports to `itsmgold`
 
 ---
 
 ## 🔧 Troubleshooting
 
-**Packages not found?** → Install via Cluster Libraries, restart cluster  
-**Model download slow?** → First run downloads ~600MB from HuggingFace  
-**Out of memory?** → Increase cluster size or reduce EMBEDDING_BATCH_SIZE
+### "ModuleNotFoundError: No module named 'sentence_transformers'"
+**Solution:** Install packages via Cluster Libraries, then **restart cluster**
 
-See EXECUTION_GUIDE.md for detailed troubleshooting.
+### "Storage access denied"
+**Solution:** Check your STORAGE_KEY in config notebook is correct
+
+### "Model download timeout"
+**Solution:** First run downloads ~600MB. Increase cluster timeout or wait for download to complete
+
+### "Image download failed"
+**Solution:** Verify images were uploaded in silver layer. Check network connectivity.
+
+### "Out of memory"
+**Solution:** Use larger cluster or reduce EMBEDDING_BATCH_SIZE in gold.py
 
 ---
 
-## 📈 Next Steps
+## 📈 Expected Timeline
 
-1. ✅ Run the notebooks (config → bronze → silver → gold)
-2. ✅ Verify data in `itsmgold` container
-3. ⬜ Create Azure AI Search index with vector fields
-4. ⬜ Import data from itsmgold Parquet files
-5. ⬜ Build agentic RAG application
+For ~120 PDFs:
+
+- **Config:** < 1 minute
+- **Bronze:** 5-10 minutes (PDF extraction)
+- **Silver:** 10-15 minutes (image upload)
+- **Gold:** 30-60 minutes (embedding generation)
+  - First run: +10 minutes for model download
+
+**Total:** ~50-90 minutes
 
 ---
 
-## ✨ Ready to Go!
+## 🎯 Next Steps: Azure AI Search
 
-All notebooks are ready to run in Databricks. Start with `config.py` and work your way through the medallion layers! 🚀
+Once your data is in `itsmgold`:
+
+1. **Create index** with vector fields:
+   - `text_embedding` (384 dimensions)
+   - `image_pixel_embedding` (512 dimensions)
+   - `image_description_embedding` (512 dimensions)
+
+2. **Import data** from `itsmgold/multimodal_embeddings_parquet/`
+
+3. **Configure hybrid search** combining:
+   - Full-text search on `content`
+   - Vector search on embeddings
+   - Filters on `doc_id`, `page_num`, `item_type`
+
+4. **Build agentic RAG** that provides:
+   - Text answers from documentation
+   - Relevant screenshots when users need visual guidance
+   - Step-by-step visual guides for ITSM support
+
+---
+
+## 📂 File Structure
+
+```
+code/
+├── config.py              ✅ Standalone notebook
+├── bronze.py              ✅ Standalone notebook
+├── silver.py              ✅ Standalone notebook
+├── gold.py                ✅ Standalone notebook
+├── README.md              📖 This file
+├── EXECUTION_GUIDE.md     📖 Detailed guide
+├── CLUSTER_SETUP.md       📖 Cluster setup
+└── requirements.txt       📋 Python packages
+```
+
+**Just 4 Python files to copy/paste into Databricks notebooks!**
+
+---
+
+## ✨ You're Ready!
+
+1. Install packages on your cluster
+2. Create 4 Databricks notebooks
+3. Copy/paste each `.py` file
+4. Update storage key in config
+5. Run in sequence: config → bronze → silver → gold
+
+Your multimodal embeddings will be ready for Azure AI Search! 🚀

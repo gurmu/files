@@ -7,17 +7,14 @@
 # MAGIC 2. Extract page text → `bronze_pdf_pages`
 # MAGIC 3. Extract images (embedded + rendered) → `bronze_pdf_images`
 # MAGIC 
-# MAGIC **Prerequisites:** Run `config.py` first
+# MAGIC **IMPORTANT:** Run the config notebook first to set up storage authentication!
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Import Configuration
-
-# COMMAND ----------
-
-# Import configuration from config notebook
-%run ./config
+# MAGIC ## Configuration
+# MAGIC 
+# MAGIC Copy these values from your config notebook:
 
 # COMMAND ----------
 
@@ -25,10 +22,22 @@ from pyspark.sql import functions as F
 import fitz  # PyMuPDF
 import io
 import hashlib
+import pandas as pd
+
+# Configuration - Update these values from config notebook
+CATALOG = "hive_metastore"
+SCHEMA = "itsm"
+ACCOUNT = "stitsmdevz33lh8"
+DFS_ENDPOINT = "dfs.core.usgovcloudapi.net"
+PDF_CONTAINER = "pdfitsm"
+
+PDF_ROOT = f"abfss://{PDF_CONTAINER}@{ACCOUNT}.{DFS_ENDPOINT}/"
 
 print("=" * 80)
 print("BRONZE LAYER: PDF Data Extraction")
 print("=" * 80)
+print(f"Catalog.Schema: {CATALOG}.{SCHEMA}")
+print(f"PDF Source: {PDF_ROOT}")
 
 # COMMAND ----------
 
@@ -37,7 +46,7 @@ print("=" * 80)
 
 # COMMAND ----------
 
-print("\n[1/3] Loading PDF binaries...")
+print("\n[1/3] Loading PDF binaries from pdfitsm container...")
 
 bronze_pdf_bin = (
     spark.read.format("binaryFile")
@@ -57,7 +66,8 @@ bronze_pdf_bin = (
 pdf_count = bronze_pdf_bin.count()
 print(f"   Found {pdf_count} PDF files")
 
-display(bronze_pdf_bin.select("file_name","path","length").limit(20))
+# Display sample
+display(bronze_pdf_bin.select("file_name", "path", "length").limit(20))
 
 # COMMAND ----------
 
@@ -73,12 +83,7 @@ print(f"   ✓ Saved {pdf_count} PDFs to bronze_pdf_bin")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 2: Extract Page Text & Images
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Define Extraction Function
+# MAGIC ## Step 2: Define Extraction Functions
 
 # COMMAND ----------
 
@@ -89,11 +94,11 @@ def stable_id(*parts) -> str:
 
 def extract_pdf_pages_and_images(pdf_bytes: bytes, doc_id: str, render_dpi: int = 150):
     """
-    Extract text and images from PDF.
+    Extract text and images from PDF using PyMuPDF.
     
     Returns:
-      pages:  [{doc_id,page_num,page_text_raw,page_text_len}]
-      images: [{doc_id,page_num,image_id,image_kind,image_name,image_mime,image_bytes,width,height}]
+      pages:  [{doc_id, page_num, page_text_raw, page_text_len}]
+      images: [{doc_id, page_num, image_id, image_kind, image_name, image_mime, image_bytes, width, height}]
     """
     pages, images = [], []
     if not pdf_bytes:
@@ -156,24 +161,23 @@ def extract_pdf_pages_and_images(pdf_bytes: bytes, doc_id: str, render_dpi: int 
     doc.close()
     return pages, images
 
-print("✓ Extraction function defined")
+print("✓ Extraction functions defined")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Extract Page Text
+# MAGIC ## Step 3: Extract Page Text
 
 # COMMAND ----------
 
-print("\n[2/3] Extracting page text...")
-
-import pandas as pd
+print("\n[2/3] Extracting page text from all PDFs...")
 
 pdfs = spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_bin").select("doc_id", "content")
 
 pages_schema = "doc_id string, page_num int, page_text_raw string, page_text_len int"
 
 def pages_map(iterator):
+    """MapInPandas function to extract page text."""
     for pdf_batch in iterator:
         out = []
         for _, r in pdf_batch.iterrows():
@@ -184,7 +188,7 @@ def pages_map(iterator):
 bronze_pages = pdfs.mapInPandas(pages_map, schema=pages_schema)
 
 page_count = bronze_pages.count()
-print(f"   Extracted {page_count} pages")
+print(f"   Extracted {page_count} pages from PDFs")
 
 # Save bronze_pdf_pages table
 (bronze_pages.write.mode("overwrite")
@@ -192,16 +196,16 @@ print(f"   Extracted {page_count} pages")
  .format("delta")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.bronze_pdf_pages"))
 
-print(f"   ✓ Saved bronze_pdf_pages")
+print(f"   ✓ Saved to bronze_pdf_pages table")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Extract Images
+# MAGIC ## Step 4: Extract Images
 
 # COMMAND ----------
 
-print("\n[3/3] Extracting images...")
+print("\n[3/3] Extracting images (embedded + page renders)...")
 
 images_schema = """
 doc_id string, page_num int, image_id string, image_kind string, image_name string,
@@ -209,6 +213,7 @@ image_mime string, image_bytes binary, width int, height int
 """
 
 def images_map(iterator):
+    """MapInPandas function to extract images."""
     for pdf_batch in iterator:
         out = []
         for _, r in pdf_batch.iterrows():
@@ -219,7 +224,7 @@ def images_map(iterator):
 bronze_images = pdfs.mapInPandas(images_map, schema=images_schema)
 
 image_count = bronze_images.count()
-print(f"   Extracted {image_count} images")
+print(f"   Extracted {image_count} images from PDFs")
 
 # Save bronze_pdf_images table
 (bronze_images.write.mode("overwrite")
@@ -227,7 +232,7 @@ print(f"   Extracted {image_count} images")
  .format("delta")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.bronze_pdf_images"))
 
-print(f"   ✓ Saved bronze_pdf_images")
+print(f"   ✓ Saved to bronze_pdf_images table")
 
 # COMMAND ----------
 
@@ -241,10 +246,10 @@ print("BRONZE LAYER COMPLETE")
 print("=" * 80)
 print(f"""
 Tables Created:
-  • bronze_pdf_bin:      {pdf_count} PDFs
-  • bronze_pdf_pages:    {page_count} pages
-  • bronze_pdf_images:   {image_count} images
+  • bronze_pdf_bin:      {pdf_count:,} PDFs
+  • bronze_pdf_pages:    {page_count:,} pages
+  • bronze_pdf_images:   {image_count:,} images
 
-Next: Run silver.py for data cleaning
+Next Step: Run the Silver layer notebook for data cleaning
 """)
 print("=" * 80)

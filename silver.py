@@ -4,29 +4,50 @@
 # MAGIC 
 # MAGIC Cleans and enriches bronze data:
 # MAGIC 1. Clean page text → `silver_pdf_pages`
-# MAGIC 2. Upload images to blob storage
+# MAGIC 2. Upload images to `itsmimages` blob storage
 # MAGIC 3. Generate image URLs → `silver_pdf_images`
 # MAGIC 
-# MAGIC **Prerequisites:** Run `config.py` and `bronze.py` first
+# MAGIC **IMPORTANT:** Run config and bronze notebooks first!
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Import Configuration
+# MAGIC ## Configuration
 
 # COMMAND ----------
 
-# Import configuration from config notebook
-%run ./config
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F, Row
+from pyspark.sql import functions as F, types as T, Row
 import re
+import hashlib
+
+# Configuration - Update these values from config notebook
+CATALOG = "hive_metastore"
+SCHEMA = "itsm"
+ACCOUNT = "stitsmdevz33lh8"
+DFS_ENDPOINT = "dfs.core.usgovcloudapi.net"
+BLOB_ENDPOINT = "blob.core.usgovcloudapi.net"
+
+IMG_CONTAINER = "itsmimages"
+IMG_ROOT = f"abfss://{IMG_CONTAINER}@{ACCOUNT}.{DFS_ENDPOINT}/"
+
+# Helper function
+def abfss_to_https(abfss_path: str) -> str:
+    """Convert ABFSS path to HTTPS URL."""
+    if not abfss_path:
+        return None
+    m = re.match(r"^abfss://([^@]+)@([^.]+)\.dfs\.core\.usgovcloudapi\.net/(.+)$", abfss_path)
+    if not m:
+        return None
+    container, account, key = m.groups()
+    return f"https://{account}.{BLOB_ENDPOINT}/{container}/{key}"
+
+abfss_to_https_udf = F.udf(abfss_to_https, T.StringType())
 
 print("=" * 80)
 print("SILVER LAYER: Data Cleaning & Enrichment")
 print("=" * 80)
+print(f"Catalog.Schema: {CATALOG}.{SCHEMA}")
+print(f"Image Storage: {IMG_ROOT}")
 
 # COMMAND ----------
 
@@ -40,24 +61,26 @@ print("\n[1/3] Cleaning page text...")
 silver_pdf_pages = (
     spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_pages").alias("p")
       .join(
-          spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_bin").select("doc_id","path","file_name").alias("b"),
+          spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_bin").select("doc_id", "path", "file_name").alias("b"),
           on="doc_id",
           how="left"
       )
       .withColumn("pdf_url", abfss_to_https_udf(F.col("path")))
       .withColumn("page_text_clean", F.trim(F.regexp_replace(F.col("page_text_raw"), r"\s+", " ")))
-      .drop("page_text_raw")
+      .drop("page_text_raw", "path")
+      .select("doc_id", "file_name", "page_num", "page_text_clean", "page_text_len", "pdf_url")
 )
 
 # Save silver_pdf_pages table
 (silver_pdf_pages.write.mode("overwrite")
- .option("mergeSchema","true")
+ .option("mergeSchema", "true")
  .format("delta")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.silver_pdf_pages"))
 
 page_count = silver_pdf_pages.count()
-print(f"   ✓ Cleaned {page_count} pages")
+print(f"   ✓ Cleaned {page_count:,} pages")
 
+# Display sample
 display(spark.table(f"{CATALOG}.{SCHEMA}.silver_pdf_pages").limit(10))
 
 # COMMAND ----------
@@ -72,39 +95,41 @@ print("\n[2/3] Uploading images to itsmimages container...")
 def write_images_partition(rows):
     """
     Upload images to blob storage using Hadoop FS API.
-    Runs on executors in distributed fashion.
+    Runs distributed on executors.
     """
     jvm = spark._jvm
     conf = spark._jsc.hadoopConfiguration()
     fs = jvm.org.apache.hadoop.fs.FileSystem.get(conf)
 
     for r in rows:
-        doc_id    = r["doc_id"]
-        page_num  = int(r["page_num"])
-        image_id  = r["image_id"]
-        kind      = r["image_kind"]
-        name      = r["image_name"]
-        b         = r["image_bytes"]
+        doc_id = r["doc_id"]
+        page_num = int(r["page_num"])
+        image_id = r["image_id"]
+        kind = r["image_kind"]
+        name = r["image_name"]
+        b = r["image_bytes"]
 
         if b is None:
             continue
 
-        # Choose extension from name (fallback png)
+        # Choose extension from name
         ext = "png"
         m = re.search(r"\.([a-zA-Z0-9]+)$", name or "")
         if m:
             ext = m.group(1).lower()
 
+        # Determine output path
         if kind == "page_render":
-            # Standard page naming
+            # Standard page naming: doc_id/page_render/page_0000.png
             out_key = f"{doc_id}/page_render/page_{page_num:04d}.png"
         else:
+            # Embedded images: doc_id/embedded/p0000_imageid.ext
             out_key = f"{doc_id}/embedded/p{page_num:04d}_{image_id}.{ext}"
 
-        out_abfss = IMG_ROOT + out_key  # IMG_ROOT already ends with '/'
+        out_abfss = IMG_ROOT + out_key
 
         path = jvm.org.apache.hadoop.fs.Path(out_abfss)
-        # Idempotent: overwrite if exists
+        # Overwrite if exists (idempotent)
         stream = fs.create(path, True)
 
         # Write bytes
@@ -129,7 +154,7 @@ print("\n[3/3] Creating image metadata with URLs...")
 silver_pdf_images = (
     spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_images").alias("i")
       .join(
-          spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_bin").select("doc_id","path","file_name").alias("b"),
+          spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_bin").select("doc_id", "path", "file_name").alias("b"),
           on="doc_id",
           how="left"
       )
@@ -138,29 +163,38 @@ silver_pdf_images = (
           "image_abfss_path",
           F.when(
               F.col("image_kind") == F.lit("page_render"),
-              F.concat(F.lit(IMG_ROOT), F.col("doc_id"), F.lit("/page_render/page_"),
-                       F.lpad(F.col("page_num").cast("string"), 4, "0"), F.lit(".png"))
+              F.concat(
+                  F.lit(IMG_ROOT), F.col("doc_id"), F.lit("/page_render/page_"),
+                  F.lpad(F.col("page_num").cast("string"), 4, "0"), F.lit(".png")
+              )
           ).otherwise(
-              F.concat(F.lit(IMG_ROOT), F.col("doc_id"), F.lit("/embedded/p"),
-                       F.lpad(F.col("page_num").cast("string"), 4, "0"),
-                       F.lit("_"), F.col("image_id"), F.lit("."),
-                       F.regexp_extract(F.col("image_name"), r"\.([A-Za-z0-9]+)$", 1))
+              F.concat(
+                  F.lit(IMG_ROOT), F.col("doc_id"), F.lit("/embedded/p"),
+                  F.lpad(F.col("page_num").cast("string"), 4, "0"),
+                  F.lit("_"), F.col("image_id"), F.lit("."),
+                  F.regexp_extract(F.col("image_name"), r"\.([A-Za-z0-9]+)$", 1)
+              )
           )
       )
       .withColumn("image_url", abfss_to_https_udf(F.col("image_abfss_path")))
-      # Drop bytes in silver to save storage
-      .drop("image_bytes")
+      # Drop bytes to save storage in silver layer
+      .drop("image_bytes", "path")
+      .select(
+          "doc_id", "file_name", "page_num", "image_id", "image_kind", "image_name",
+          "image_mime", "width", "height", "image_abfss_path", "image_url", "pdf_url"
+      )
 )
 
 # Save silver_pdf_images table
 (silver_pdf_images.write.mode("overwrite")
- .option("mergeSchema","true")
+ .option("mergeSchema", "true")
  .format("delta")
  .saveAsTable(f"{CATALOG}.{SCHEMA}.silver_pdf_images"))
 
 image_count = silver_pdf_images.count()
-print(f"   ✓ Created metadata for {image_count} images")
+print(f"   ✓ Created metadata for {image_count:,} images")
 
+# Display sample
 display(spark.table(f"{CATALOG}.{SCHEMA}.silver_pdf_images").limit(10))
 
 # COMMAND ----------
@@ -175,11 +209,11 @@ print("SILVER LAYER COMPLETE")
 print("=" * 80)
 print(f"""
 Tables Created:
-  • silver_pdf_pages:    {page_count} pages (cleaned text)
-  • silver_pdf_images:   {image_count} images (with URLs)
+  • silver_pdf_pages:    {page_count:,} pages (cleaned text + URLs)
+  • silver_pdf_images:   {image_count:,} images (metadata + URLs)
 
 Images stored in: {IMG_ROOT}
 
-Next: Run gold.py for embedding generation
+Next Step: Run the Gold layer notebook for embedding generation
 """)
 print("=" * 80)

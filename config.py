@@ -2,16 +2,37 @@
 # MAGIC %md
 # MAGIC # Configuration - Multimodal Embedding Pipeline
 # MAGIC 
-# MAGIC Central configuration for all medallion layers:
-# MAGIC - Azure Gov Cloud storage settings
-# MAGIC - Catalog and schema definitions
-# MAGIC - Embedding model configuration
-# MAGIC - Helper functions
+# MAGIC **IMPORTANT:** Update the STORAGE_KEY with your actual Azure storage key before running!
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Required Imports
 
 # COMMAND ----------
 
 from pyspark.sql import functions as F, types as T
 import re, hashlib
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Storage Authentication
+
+# COMMAND ----------
+
+# **TODO: Replace with your actual storage account key (Key1 from Azure portal)**
+STORAGE_KEY = "<PASTE_KEY1_HERE>".strip()
+
+# Azure Gov Storage Account
+ACCOUNT = "stitsmdevz33lh8"
+DFS_ENDPOINT = "dfs.core.usgovcloudapi.net"
+BLOB_ENDPOINT = "blob.core.usgovcloudapi.net"
+
+# Configure Spark to access Azure storage
+spark.conf.set(f"fs.azure.account.key.{ACCOUNT}.{DFS_ENDPOINT}", STORAGE_KEY)
+
+print("✓ Storage authentication configured")
 
 # COMMAND ----------
 
@@ -26,20 +47,14 @@ SCHEMA  = "itsm"
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
-print(f"Using catalog: {CATALOG}")
-print(f"Using schema: {SCHEMA}")
+print(f"✓ Using catalog: {CATALOG}.{SCHEMA}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Azure Gov Storage Configuration
+# MAGIC ## Container Configuration
 
 # COMMAND ----------
-
-# Azure Gov Storage Account
-ACCOUNT       = "stitsmdevz33lh8"
-DFS_ENDPOINT  = "dfs.core.usgovcloudapi.net"
-BLOB_ENDPOINT = "blob.core.usgovcloudapi.net"
 
 # Container names
 PDF_CONTAINER = "pdfitsm"        # source PDFs (~120 files)
@@ -51,9 +66,10 @@ PDF_ROOT = f"abfss://{PDF_CONTAINER}@{ACCOUNT}.{DFS_ENDPOINT}/"
 IMG_ROOT = f"abfss://{IMG_CONTAINER}@{ACCOUNT}.{DFS_ENDPOINT}/"
 GOLD_ROOT = f"abfss://{GOLD_CONTAINER}@{ACCOUNT}.{DFS_ENDPOINT}/"
 
-print("PDF_ROOT:", PDF_ROOT)
-print("IMG_ROOT:", IMG_ROOT)
-print("GOLD_ROOT:", GOLD_ROOT)
+print("Container paths:")
+print(f"  PDF_ROOT:  {PDF_ROOT}")
+print(f"  IMG_ROOT:  {IMG_ROOT}")
+print(f"  GOLD_ROOT: {GOLD_ROOT}")
 
 # COMMAND ----------
 
@@ -76,9 +92,10 @@ CHUNK_OVERLAP = 150         # word overlap between chunks
 # Embedding batch size (for performance)
 EMBEDDING_BATCH_SIZE = 32
 
-print(f"Text model: {TEXT_EMBEDDING_MODEL} ({TEXT_EMBEDDING_DIM}-dim)")
-print(f"Image model: {IMAGE_CLIP_MODEL} ({IMAGE_EMBEDDING_DIM}-dim)")
-print(f"Chunk size: {CHUNK_SIZE} words with {CHUNK_OVERLAP} overlap")
+print("Embedding configuration:")
+print(f"  Text model:  {TEXT_EMBEDDING_MODEL} ({TEXT_EMBEDDING_DIM}-dim)")
+print(f"  Image model: {IMAGE_CLIP_MODEL} ({IMAGE_EMBEDDING_DIM}-dim)")
+print(f"  Chunk size:  {CHUNK_SIZE} words with {CHUNK_OVERLAP} overlap")
 
 # COMMAND ----------
 
@@ -116,7 +133,4 @@ print("✓ Helper functions defined")
 # MAGIC %md
 # MAGIC ## ✅ Configuration Complete
 # MAGIC 
-# MAGIC All configuration loaded. You can now run:
-# MAGIC - `bronze.py` for data extraction
-# MAGIC - `silver.py` for data cleaning
-# MAGIC - `gold.py` for embedding generation
+# MAGIC You can now continue to the Bronze layer notebook for PDF extraction.
