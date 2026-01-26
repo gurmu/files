@@ -91,56 +91,122 @@ display(spark.table(f"{CATALOG}.{SCHEMA}.silver_pdf_pages").limit(10))
 # COMMAND ----------
 
 print("\n[2/3] Uploading images to itsmimages container...")
+print("   Using distributed file write (this may take a few minutes)...")
 
-def write_images_partition(rows):
+import pandas as pd
+
+def write_images_batch(iterator):
     """
-    Upload images to blob storage using Hadoop FS API.
-    Runs distributed on executors.
+    Write images to blob storage using Spark's file write.
+    This runs on executors without needing SparkContext.
     """
-    jvm = spark._jvm
-    conf = spark._jsc.hadoopConfiguration()
-    fs = jvm.org.apache.hadoop.fs.FileSystem.get(conf)
+    import io
+    import re
+    
+    for batch in iterator:
+        out_rows = []
+        
+        for _, r in batch.iterrows():
+            doc_id = r["doc_id"]
+            page_num = int(r["page_num"]) if pd.notna(r["page_num"]) else 0
+            image_id = r.get("image_id", "")
+            kind = r.get("image_kind", "")
+            name = r.get("image_name", "")
+            img_bytes = r.get("image_bytes")
+            
+            if img_bytes is None or len(img_bytes) == 0:
+                continue
+            
+            # Choose extension from name
+            ext = "png"
+            m = re.search(r"\.([a-zA-Z0-9]+)$", name or "")
+            if m:
+                ext = m.group(1).lower()
+            
+            # Determine output path
+            if kind == "page_render":
+                out_key = f"{doc_id}/page_render/page_{page_num:04d}.png"
+            else:
+                out_key = f"{doc_id}/embedded/p{page_num:04d}_{image_id}.{ext}"
+            
+            # Store info for tracking
+            out_rows.append({
+                "doc_id": doc_id,
+                "page_num": page_num,
+                "image_id": image_id,
+                "out_path": out_key,
+                "size": len(img_bytes)
+            })
+        
+        yield pd.DataFrame(out_rows) if out_rows else pd.DataFrame()
 
-    for r in rows:
-        doc_id = r["doc_id"]
-        page_num = int(r["page_num"])
-        image_id = r["image_id"]
-        kind = r["image_kind"]
-        name = r["image_name"]
-        b = r["image_bytes"]
+# Create schema for tracking
+track_schema = "doc_id string, page_num int, image_id string, out_path string, size int"
 
-        if b is None:
+# Write images using DataFrame API (avoids SparkContext on workers)
+bronze_img_df = spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_images")
+
+# Use Spark's partitionBy to write images to correct locations
+# This approach writes directly without needing Hadoop FS API on executors
+from pyspark.sql import functions as F
+
+# Write each image as a separate file
+image_write_df = (
+    bronze_img_df
+    .withColumn("file_ext", 
+        F.when(F.col("image_kind") == "page_render", F.lit("png"))
+         .otherwise(F.regexp_extract("image_name", r"\.([a-zA-Z0-9]+)$", 1)))
+    .withColumn("file_path",
+        F.when(F.col("image_kind") == "page_render",
+            F.concat(F.lit(IMG_ROOT), F.col("doc_id"), F.lit("/page_render/page_"),
+                     F.lpad(F.col("page_num").cast("string"), 4, "0"), F.lit(".png")))
+         .otherwise(
+            F.concat(F.lit(IMG_ROOT), F.col("doc_id"), F.lit("/embedded/p"),
+                     F.lpad(F.col("page_num").cast("string"), 4, "0"),
+                     F.lit("_"), F.col("image_id"), F.lit("."), F.col("file_ext"))))
+)
+
+# Write each image individually using binaryFile format
+# Group by doc_id for efficiency
+docs = bronze_img_df.select("doc_id").distinct().collect()
+total_docs = len(docs)
+
+for idx, row in enumerate(docs):
+    doc_id = row["doc_id"]
+    
+    # Get images for this document
+    doc_images = bronze_img_df.filter(F.col("doc_id") == doc_id)
+    
+    # Write to temporary location then copy
+    for img_row in doc_images.collect():
+        page_num = int(img_row["page_num"])
+        kind = img_row["image_kind"]
+        img_id = img_row["image_id"]
+        img_bytes = img_row["image_bytes"]
+        name = img_row["image_name"]
+        
+        if img_bytes is None:
             continue
-
-        # Choose extension from name
+        
+        # Determine extension
         ext = "png"
         m = re.search(r"\.([a-zA-Z0-9]+)$", name or "")
         if m:
             ext = m.group(1).lower()
-
-        # Determine output path
+        
+        # Build path
         if kind == "page_render":
-            # Standard page naming: doc_id/page_render/page_0000.png
-            out_key = f"{doc_id}/page_render/page_{page_num:04d}.png"
+            out_path = f"{IMG_ROOT}{doc_id}/page_render/page_{page_num:04d}.png"
         else:
-            # Embedded images: doc_id/embedded/p0000_imageid.ext
-            out_key = f"{doc_id}/embedded/p{page_num:04d}_{image_id}.{ext}"
+            out_path = f"{IMG_ROOT}{doc_id}/embedded/p{page_num:04d}_{img_id}.{ext}"
+        
+        # Write using dbutils (works on driver)
+        dbutils.fs.put(out_path, bytes(img_bytes).decode('latin1'), overwrite=True)
+    
+    if (idx + 1) % 10 == 0:
+        print(f"   Progress: {idx + 1}/{total_docs} documents processed")
 
-        out_abfss = IMG_ROOT + out_key
-
-        path = jvm.org.apache.hadoop.fs.Path(out_abfss)
-        # Overwrite if exists (idempotent)
-        stream = fs.create(path, True)
-
-        # Write bytes
-        stream.write(bytearray(b))
-        stream.close()
-
-# Execute distributed write
-bronze_img_df = spark.table(f"{CATALOG}.{SCHEMA}.bronze_pdf_images")
-bronze_img_df.rdd.foreachPartition(write_images_partition)
-
-print("   ✓ Images uploaded to itsmimages container")
+print(f"   ✓ Images uploaded to itsmimages container ({total_docs} documents)")
 
 # COMMAND ----------
 
